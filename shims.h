@@ -14,6 +14,19 @@ wasmtime_error_t *go_linker_define_func(
     size_t env
 );
 
+wasmtime_error_t *go_component_linker_instance_add_func(
+    wasmtime_component_linker_instance_t *linker_instance,
+    const char *name,
+    size_t name_len,
+    size_t env
+);
+wasmtime_error_t *go_component_linker_instance_add_resource(
+    wasmtime_component_linker_instance_t *linker_instance,
+    const char *name,
+    size_t name_len,
+    const wasmtime_component_resource_type_t *ty
+);
+
 #define EACH_UNION_ACCESSOR(name) \
   UNION_ACCESSOR(wasmtime_val, i32, int32_t) \
   UNION_ACCESSOR(wasmtime_val, i64, int64_t) \
@@ -24,7 +37,10 @@ wasmtime_error_t *go_linker_define_func(
   UNION_ACCESSOR(wasmtime_extern, func, wasmtime_func_t) \
   UNION_ACCESSOR(wasmtime_extern, memory, wasmtime_memory_t) \
   UNION_ACCESSOR(wasmtime_extern, table, wasmtime_table_t) \
-  UNION_ACCESSOR(wasmtime_extern, global, wasmtime_global_t)
+  UNION_ACCESSOR(wasmtime_extern, global, wasmtime_global_t) \
+  \
+  UNION_ACCESSOR(wasmtime_component_val, u64, uint64_t) \
+  UNION_ACCESSOR(wasmtime_component_val, resource, wasmtime_component_resource_any_t*)
 
 #define UNION_ACCESSOR(name, field, ty) \
   ty go_##name##_##field##_get(const name##_t *val); \

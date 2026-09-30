@@ -150,7 +150,12 @@ func (store *Store) SetEpochDeadline(deadline uint64) {
 // Returns the underlying `*storeData` that this store references in Go, used
 // for inserting functions or storing panic data.
 func getDataInStore(store Storelike) *storeData {
-	data := uintptr(C.wasmtime_context_get_data(store.Context()))
+	return getDataInContext(store.Context())
+}
+
+// getDataInContext is getDataInStore for callbacks that only get a context.
+func getDataInContext(ctx *C.wasmtime_context_t) *storeData {
+	data := uintptr(C.wasmtime_context_get_data(ctx))
 	gStoreLock.Lock()
 	defer gStoreLock.Unlock()
 	return gStoreMap[int(data)]

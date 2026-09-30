@@ -9,6 +9,10 @@ import "runtime"
 // instantiate it. Use [NewComponentLinker] to create one.
 type ComponentLinker struct {
 	_ptr *C.wasmtime_component_linker_t
+
+	// locked is set while a [ComponentLinkerInstance] from [ComponentLinker.Root]
+	// is open, because the C API requires exclusive access to the linker then.
+	locked bool
 }
 
 // NewComponentLinker creates a new [ComponentLinker] for the given engine.
@@ -31,8 +35,23 @@ func (l *ComponentLinker) ptr() *C.wasmtime_component_linker_t {
 	if ret == nil {
 		panic("object has been closed already")
 	}
+	if l.locked {
+		panic("linker is locked by an open ComponentLinkerInstance")
+	}
 	maybeGC()
 	return ret
+}
+
+// Root returns the root instance of this linker, used to define names in the
+// root namespace.
+//
+// The linker is locked until the returned instance is closed: every other
+// method of the linker panics in the meantime.
+func (l *ComponentLinker) Root() *ComponentLinkerInstance {
+	ptr := C.wasmtime_component_linker_root(l.ptr())
+	runtime.KeepAlive(l)
+	l.locked = true
+	return mkComponentLinkerInstance(ptr, func() { l.locked = false })
 }
 
 // Instantiate creates a new [ComponentInstance] of `component` using the
@@ -71,13 +90,8 @@ func (l *ComponentLinker) DefineUnknownImportsAsTraps(component *Component) erro
 	return nil
 }
 
-// TODO: expose ComponentLinker.Root() and the LinkerInstance type so host
-// functions, modules, and resources can be defined. The C API has an
-// "exclusive access" requirement on the parent linker while a
-// LinkerInstance is alive; mirror that with a locking flag (see
-// wasmtime-py's `Linker.locked` for the reference pattern). The
-// `wasmtime_component_linker_allow_shadowing` knob is meaningful only once
-// definitions exist, so it will be wired up alongside the host-side API.
+// TODO: expose `wasmtime_component_linker_allow_shadowing` now that
+// definitions exist.
 // TODO: WASIp2 / wasi:http integration via `wasmtime_component_linker_add_*`.
 
 // Close deallocates this linker's state explicitly.
@@ -86,6 +100,9 @@ func (l *ComponentLinker) DefineUnknownImportsAsTraps(component *Component) erro
 func (l *ComponentLinker) Close() {
 	if l._ptr == nil {
 		return
+	}
+	if l.locked {
+		panic("linker is locked by an open ComponentLinkerInstance")
 	}
 	runtime.SetFinalizer(l, nil)
 	C.wasmtime_component_linker_delete(l._ptr)
