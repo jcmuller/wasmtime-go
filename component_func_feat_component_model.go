@@ -37,6 +37,9 @@ func (i *ComponentInstance) GetFunc(store Storelike, idx *ComponentExportIndex) 
 // The supported Go types are:
 //
 //   - `uint64` for `u64`
+//   - `string` for `string`
+//   - `[]interface{}` for `list`
+//   - [ComponentRecord] for `record`
 //   - `*ComponentResourceHost` for `own` and `borrow` handles to host resources
 //
 // A handle passed as an argument must be owned. For a `borrow` parameter the

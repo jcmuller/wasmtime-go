@@ -40,6 +40,9 @@ wasmtime_error_t *go_component_linker_instance_add_resource(
   UNION_ACCESSOR(wasmtime_extern, global, wasmtime_global_t) \
   \
   UNION_ACCESSOR(wasmtime_component_val, u64, uint64_t) \
+  UNION_ACCESSOR(wasmtime_component_val, string, wasm_name_t) \
+  UNION_ACCESSOR(wasmtime_component_val, list, wasmtime_component_vallist_t) \
+  UNION_ACCESSOR(wasmtime_component_val, record, wasmtime_component_valrecord_t) \
   UNION_ACCESSOR(wasmtime_component_val, resource, wasmtime_component_resource_any_t*)
 
 #define UNION_ACCESSOR(name, field, ty) \

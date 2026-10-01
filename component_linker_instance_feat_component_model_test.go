@@ -2,6 +2,7 @@ package wasmtime
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -119,8 +120,108 @@ func TestComponentFuncCallArgErrors(t *testing.T) {
 	_, err := fn.Call(store)
 	require.ErrorContains(t, err, "wrong number of arguments")
 
-	_, err = fn.Call(store, "not a u64")
-	require.ErrorContains(t, err, "unsupported component value type string")
+	_, err = fn.Call(store, 1)
+	require.ErrorContains(t, err, "unsupported component value type int")
+}
+
+// echoWat imports `echo` of type `%[1]s -> %[1]s` from the host and exports
+// `run` of the same type, which calls it. A bump allocator serves realloc.
+const echoWat = `(component
+  (import "test:host/echo" (instance $h
+    (type $point' (record (field "x" u64) (field "y" u64)))
+    (export "point" (type $point (eq $point')))
+    (export "echo" (func (param "v" %[1]s) (result %[1]s)))))
+  (alias export $h "point" (type $point))
+  (alias export $h "echo" (func $echo))
+  (core module $libc
+    (memory (export "mem") 1)
+    (global $next (mut i32) (i32.const 2048))
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $p i32)
+      global.get $next
+      i32.const 7
+      i32.add
+      i32.const -8
+      i32.and
+      local.tee $p
+      local.get 3
+      i32.add
+      global.set $next
+      local.get $p))
+  (core instance $libc (instantiate $libc))
+  (alias core export $libc "mem" (core memory $mem))
+  (alias core export $libc "realloc" (core func $realloc))
+  (core func $echo-core (canon lower (func $echo) (memory $mem) (realloc $realloc)))
+  (core module $m
+    (import "host" "echo" (func $echo (param i32 i32 i32)))
+    (func (export "run") (param i32 i32) (result i32)
+      local.get 0
+      local.get 1
+      i32.const 1024
+      call $echo
+      i32.const 1024))
+  (core instance $hi (export "echo" (func $echo-core)))
+  (core instance $i (instantiate $m (with "host" (instance $hi))))
+  (func (export "run") (param "v" %[1]s) (result %[1]s)
+    (canon lift (core func $i "run") (memory $mem) (realloc $realloc))))`
+
+// instantiateEcho instantiates echoWat for `ty` with `f` behind `echo`.
+func instantiateEcho(t *testing.T, ty string, f func([]interface{}) (interface{}, error)) (*Store, *ComponentFunc) {
+	t.Helper()
+	engine := newComponentEngine()
+	store := NewStore(engine)
+	component := newComponent(t, engine, fmt.Sprintf(echoWat, ty))
+	defer component.Close()
+
+	linker := defineFunc(t, engine, "test:host/echo", "echo", f)
+	defer linker.Close()
+
+	instance, err := linker.Instantiate(store, component)
+	require.NoError(t, err)
+
+	idx := instance.GetExportIndex(store, nil, "run")
+	require.NotNil(t, idx)
+	defer idx.Close()
+
+	return store, instance.GetFunc(store, idx)
+}
+
+func echoArg(args []interface{}) (interface{}, error) { return args[0], nil }
+
+func TestComponentFuncStringRoundTrip(t *testing.T) {
+	store, fn := instantiateEcho(t, "string", echoArg)
+
+	for _, s := range []string{"", "héllo 👩‍👩‍👧"} {
+		result, err := fn.Call(store, s)
+		require.NoError(t, err)
+		require.Equal(t, s, result)
+	}
+}
+
+func TestComponentFuncListOfRecordsRoundTrip(t *testing.T) {
+	store, fn := instantiateEcho(t, "(list $point)", echoArg)
+
+	points := []interface{}{
+		ComponentRecord{{Name: "x", Val: uint64(1)}, {Name: "y", Val: uint64(2)}},
+		ComponentRecord{{Name: "x", Val: uint64(3)}, {Name: "y", Val: uint64(4)}},
+	}
+	result, err := fn.Call(store, points)
+	require.NoError(t, err)
+	require.Equal(t, points, result)
+
+	result, err = fn.Call(store, []interface{}{})
+	require.NoError(t, err)
+	require.Equal(t, []interface{}{}, result)
+}
+
+func TestComponentFuncListWithBadElement(t *testing.T) {
+	store, fn := instantiateEcho(t, "(list $point)", echoArg)
+
+	_, err := fn.Call(store, []interface{}{
+		ComponentRecord{{Name: "x", Val: uint64(1)}, {Name: "y", Val: uint64(2)}},
+		ComponentRecord{{Name: "x", Val: uint64(1)}, {Name: "y", Val: 2}},
+	})
+	require.ErrorContains(t, err, "unsupported component value type int")
 }
 
 func TestComponentFuncCallAfterComponentClose(t *testing.T) {
