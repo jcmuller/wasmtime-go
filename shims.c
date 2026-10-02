@@ -86,23 +86,23 @@ wasmtime_error_t *go_component_linker_instance_add_func(
       component_trampoline, (void*) env, goFinalizeComponentFunc);
 }
 
-// Host resources have no Go destructor yet, so a guest drop only frees the handle.
 static wasmtime_error_t* component_resource_destructor(
    void *env,
    wasmtime_context_t *context,
    uint32_t rep
 ) {
-    return NULL;
+    return goComponentResourceDestructor(context, (size_t) env, rep);
 }
 
 wasmtime_error_t *go_component_linker_instance_add_resource(
     wasmtime_component_linker_instance_t *linker_instance,
     const char *name,
     size_t name_len,
-    const wasmtime_component_resource_type_t *ty
+    const wasmtime_component_resource_type_t *ty,
+    size_t env
 ) {
   return wasmtime_component_linker_instance_add_resource(linker_instance, name, name_len,
-      ty, component_resource_destructor, NULL, NULL);
+      ty, component_resource_destructor, (void*) env, goFinalizeComponentResourceDestructor);
 }
 
 #define UNION_ACCESSOR(name, field, ty) \

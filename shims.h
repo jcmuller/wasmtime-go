@@ -24,7 +24,8 @@ wasmtime_error_t *go_component_linker_instance_add_resource(
     wasmtime_component_linker_instance_t *linker_instance,
     const char *name,
     size_t name_len,
-    const wasmtime_component_resource_type_t *ty
+    const wasmtime_component_resource_type_t *ty,
+    size_t env
 );
 
 #define EACH_UNION_ACCESSOR(name) \

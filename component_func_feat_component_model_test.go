@@ -1,6 +1,7 @@
 package wasmtime
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 
@@ -52,9 +53,9 @@ const borrowWat = `(component
   (func (export "run") %[1]s
     (canon lift (core func $i "run") (memory $mem) (realloc $realloc))))`
 
-// instantiateBorrow instantiates borrowWat with `len` behind `[method]doc.len`
-// and returns its `run` export.
-func instantiateBorrow(t *testing.T, types, params, coreParams, body string, len func([]interface{}) (interface{}, error)) (*Store, *ComponentFunc) {
+// instantiateBorrow instantiates borrowWat with `drop` as the destructor of
+// `doc` and returns its `run` export.
+func instantiateBorrow(t *testing.T, types, params, coreParams, body string, drop func(uint32) error) (*Store, *ComponentFunc) {
 	t.Helper()
 	engine := newComponentEngine()
 	store := NewStore(engine)
@@ -66,8 +67,8 @@ func instantiateBorrow(t *testing.T, types, params, coreParams, body string, len
 	root := linker.Root()
 	li, err := root.AddInstance("test:host/doc")
 	require.NoError(t, err)
-	require.NoError(t, li.AddResource("doc", NewComponentResourceTypeHost(7)))
-	require.NoError(t, li.AddFunc("[method]doc.len", len))
+	require.NoError(t, li.AddResource("doc", NewComponentResourceTypeHost(7), drop))
+	require.NoError(t, li.AddFunc("[method]doc.len", docLen))
 	li.Close()
 	root.Close()
 
@@ -86,7 +87,7 @@ func doc() *ComponentResourceHost { return NewComponentResourceHost(true, 3, 7) 
 // After a trap wasmtime still counts the borrow it lent, so the handle stays
 // in the store until the store closes, and Call returns the trap alone.
 func TestComponentFuncTrapWithABorrowReturnsOnlyTheTrap(t *testing.T) {
-	store, fn := instantiateBorrow(t, "", `(param "d" (borrow $doc))`, "(param i32)", "unreachable", docLen)
+	store, fn := instantiateBorrow(t, "", `(param "d" (borrow $doc))`, "(param i32)", "unreachable", nil)
 
 	_, err := fn.Call(store, doc())
 	require.ErrorContains(t, err, "unreachable")
@@ -96,7 +97,7 @@ func TestComponentFuncTrapWithABorrowReturnsOnlyTheTrap(t *testing.T) {
 func TestComponentFuncDropsABorrowInARecord(t *testing.T) {
 	store, fn := instantiateBorrow(t, `(type $r (record (field "d" (borrow $doc))))
   (export $r2 "r" (type $r))`, `(param "r" $r2)`, "(param i32)",
-		"local.get 0\n      call $drop", docLen)
+		"local.get 0\n      call $drop", nil)
 
 	_, err := fn.Call(store, ComponentRecord{{Name: "d", Val: doc()}})
 	require.NoError(t, err)
@@ -105,7 +106,7 @@ func TestComponentFuncDropsABorrowInARecord(t *testing.T) {
 
 func TestComponentFuncDropsABorrowInAList(t *testing.T) {
 	store, fn := instantiateBorrow(t, "", `(param "l" (list (borrow $doc)))`, "(param i32 i32)",
-		"local.get 0\n      i32.load\n      call $drop", docLen)
+		"local.get 0\n      i32.load\n      call $drop", nil)
 
 	_, err := fn.Call(store, []interface{}{doc()})
 	require.NoError(t, err)
@@ -113,7 +114,7 @@ func TestComponentFuncDropsABorrowInAList(t *testing.T) {
 }
 
 func TestComponentFuncDropsTheHandlesBeforeABadArg(t *testing.T) {
-	store, fn := instantiateBorrow(t, "", `(param "d" (borrow $doc)) (param "x" u64)`, "(param i32 i64)", "", docLen)
+	store, fn := instantiateBorrow(t, "", `(param "d" (borrow $doc)) (param "x" u64)`, "(param i32 i64)", "", nil)
 
 	_, err := fn.Call(store, doc(), 1)
 	require.ErrorContains(t, err, "unsupported component value type int")
@@ -121,7 +122,7 @@ func TestComponentFuncDropsTheHandlesBeforeABadArg(t *testing.T) {
 }
 
 func TestComponentFuncDropsTheHandlesBeforeABadElement(t *testing.T) {
-	store, fn := instantiateBorrow(t, "", `(param "l" (list (borrow $doc)))`, "(param i32 i32)", "", docLen)
+	store, fn := instantiateBorrow(t, "", `(param "l" (list (borrow $doc)))`, "(param i32 i32)", "", nil)
 
 	_, err := fn.Call(store, []interface{}{doc(), 1})
 	require.ErrorContains(t, err, "unsupported component value type int")
@@ -130,9 +131,37 @@ func TestComponentFuncDropsTheHandlesBeforeABadElement(t *testing.T) {
 
 func TestComponentFuncDropsTheHandlesBeforeABadField(t *testing.T) {
 	store, fn := instantiateBorrow(t, `(type $r (record (field "d" (borrow $doc)) (field "x" u64)))
-  (export $r2 "r" (type $r))`, `(param "r" $r2)`, "(param i32 i64)", "", docLen)
+  (export $r2 "r" (type $r))`, `(param "r" $r2)`, "(param i32 i64)", "", nil)
 
 	_, err := fn.Call(store, ComponentRecord{{Name: "d", Val: doc()}, {Name: "x", Val: 1}})
 	require.ErrorContains(t, err, "unsupported component value type int")
 	require.Equal(t, 1, getDataInStore(store).droppedHandles)
+}
+
+func TestComponentFuncRunsTheDestructorWhenTheGuestDropsAnOwnedHandle(t *testing.T) {
+	var dropped []uint32
+	store, fn := instantiateBorrow(t, "", `(param "d" (own $doc))`, "(param i32)",
+		"local.get 0\n      call $drop", func(rep uint32) error {
+			dropped = append(dropped, rep)
+			return nil
+		})
+
+	_, err := fn.Call(store, doc())
+	require.NoError(t, err)
+	require.Equal(t, []uint32{3}, dropped)
+}
+
+func TestComponentFuncTrapsWhenTheDestructorFails(t *testing.T) {
+	store, fn := instantiateBorrow(t, "", `(param "d" (own $doc))`, "(param i32)",
+		"local.get 0\n      call $drop", func(uint32) error { return errors.New("doc is busy") })
+
+	_, err := fn.Call(store, doc())
+	require.ErrorContains(t, err, "doc is busy")
+}
+
+func TestComponentFuncPanicsWhenTheDestructorPanics(t *testing.T) {
+	store, fn := instantiateBorrow(t, "", `(param "d" (own $doc))`, "(param i32)",
+		"local.get 0\n      call $drop", func(uint32) error { panic("host bug") })
+
+	require.PanicsWithValue(t, "host bug", func() { _, _ = fn.Call(store, doc()) })
 }

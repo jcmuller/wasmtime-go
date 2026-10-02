@@ -91,14 +91,22 @@ func (li *ComponentLinkerInstance) AddFunc(name string, f func(args []interface{
 
 // AddResource defines the resource type `name` in this instance as `ty`.
 //
-// A guest that drops an owned handle of this type only frees the handle; the
-// host is not notified.
-func (li *ComponentLinkerInstance) AddResource(name string, ty *ComponentResourceType) error {
+// When a guest drops an owned handle of this type, `drop` runs with the
+// handle's rep, so the host can release what the rep points at. The drop of a
+// handle that [ComponentFunc.Call] lent runs no `drop`. A nil `drop` does
+// nothing. If `drop` returns an error, the drop traps with its message. If
+// `drop` panics, the drop traps and the panic resumes in Go at the call that
+// entered the guest.
+func (li *ComponentLinkerInstance) AddResource(name string, ty *ComponentResourceType, drop func(rep uint32) error) error {
+	if drop == nil {
+		drop = func(uint32) error { return nil }
+	}
 	err := C.go_component_linker_instance_add_resource(
 		li.ptr(),
 		C._GoStringPtr(name),
 		C._GoStringLen(name),
 		ty.ptr(),
+		C.size_t(insertComponentResourceDestructor(drop)),
 	)
 	runtime.KeepAlive(li)
 	runtime.KeepAlive(name)
@@ -137,6 +145,51 @@ func insertComponentFunc(f func([]interface{}) (interface{}, error)) int {
 	idx := gComponentFuncSlab.allocate()
 	gComponentFunc[idx] = f
 	return idx
+}
+
+var (
+	gComponentResourceDestructorLock sync.Mutex
+	gComponentResourceDestructor     = make(map[int]func(uint32) error)
+	gComponentResourceDestructorSlab slab
+)
+
+func insertComponentResourceDestructor(f func(uint32) error) int {
+	gComponentResourceDestructorLock.Lock()
+	defer gComponentResourceDestructorLock.Unlock()
+	idx := gComponentResourceDestructorSlab.allocate()
+	gComponentResourceDestructor[idx] = f
+	return idx
+}
+
+//export goFinalizeComponentResourceDestructor
+func goFinalizeComponentResourceDestructor(env unsafe.Pointer) {
+	idx := int(uintptr(env))
+	gComponentResourceDestructorLock.Lock()
+	defer gComponentResourceDestructorLock.Unlock()
+	delete(gComponentResourceDestructor, idx)
+	gComponentResourceDestructorSlab.deallocate(idx)
+}
+
+//export goComponentResourceDestructor
+func goComponentResourceDestructor(ctx *C.wasmtime_context_t, env C.size_t, rep C.uint32_t) *C.wasmtime_error_t {
+	gComponentResourceDestructorLock.Lock()
+	f := gComponentResourceDestructor[int(env)]
+	gComponentResourceDestructorLock.Unlock()
+
+	var err error
+	var lastPanic interface{}
+	func() {
+		defer func() { lastPanic = recover() }()
+		err = f(uint32(rep))
+	}()
+	if lastPanic != nil {
+		getDataInContext(ctx).lastPanic = lastPanic
+		return newComponentError("go panicked")
+	}
+	if err != nil {
+		return newComponentError(err.Error())
+	}
+	return nil
 }
 
 //export goFinalizeComponentFunc

@@ -287,7 +287,11 @@ func TestComponentFuncHostResource(t *testing.T) {
 	root := linker.Root()
 	li, err := root.AddInstance("test:host/doc")
 	require.NoError(t, err)
-	require.NoError(t, li.AddResource("doc", NewComponentResourceTypeHost(7)))
+	var dropped []uint32
+	require.NoError(t, li.AddResource("doc", NewComponentResourceTypeHost(7), func(rep uint32) error {
+		dropped = append(dropped, rep)
+		return nil
+	}))
 	require.NoError(t, li.AddFunc("[method]doc.len", func(args []interface{}) (interface{}, error) {
 		self = args[0].(*ComponentResourceHost)
 		return uint64(10), nil
@@ -310,6 +314,8 @@ func TestComponentFuncHostResource(t *testing.T) {
 	require.Equal(t, uint32(3), self.Rep())
 	require.Equal(t, uint32(7), self.Type())
 	require.False(t, self.Owned())
+	// Call drops a lent handle as a borrow, which runs no destructor.
+	require.Empty(t, dropped)
 
 	_, err = fn.Call(store, NewComponentResourceHost(false, 3, 7))
 	require.ErrorContains(t, err, "borrow handle exists only inside a call")
