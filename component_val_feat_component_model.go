@@ -193,6 +193,12 @@ func setComponentVal(ctx *C.wasmtime_context_t, dst *C.wasmtime_component_val_t,
 		}
 		for i, e := range v {
 			if err := setComponentVal(ctx, &elems[i], e); err != nil {
+				for j := range elems[:i] {
+					if dropErr := dropResources(ctx, &elems[j]); dropErr != nil {
+						err = errors.Join(err, dropErr)
+						break
+					}
+				}
 				C.wasmtime_component_vallist_delete(&l)
 				return err
 			}
@@ -209,6 +215,12 @@ func setComponentVal(ctx *C.wasmtime_context_t, dst *C.wasmtime_component_val_t,
 		}
 		for i, f := range v {
 			if err := setComponentVal(ctx, &entries[i].val, f.Val); err != nil {
+				for j := range entries[:i] {
+					if dropErr := dropResources(ctx, &entries[j].val); dropErr != nil {
+						err = errors.Join(err, dropErr)
+						break
+					}
+				}
 				C.wasmtime_component_valrecord_delete(&r)
 				return err
 			}

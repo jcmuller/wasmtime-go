@@ -53,6 +53,10 @@ type storeData struct {
 	funcWrap  []funcWrapEntry
 	lastPanic interface{}
 
+	// droppedHandles counts the host handles that ComponentFunc.Call dropped
+	// after a call or after a bad arg, so tests can see a leaked one.
+	droppedHandles int
+
 	// arbitrary data supplied by the embedder
 	data interface{}
 }
