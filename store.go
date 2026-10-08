@@ -57,6 +57,10 @@ type storeData struct {
 	// after a call or after a bad arg, so tests can see a leaked one.
 	droppedHandles int
 
+	// componentTrapped is set once a component call in this store fails.
+	// wasmtime then refuses each later call before it lowers the args.
+	componentTrapped bool
+
 	// arbitrary data supplied by the embedder
 	data interface{}
 }

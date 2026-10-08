@@ -55,7 +55,8 @@ func (i *ComponentInstance) GetFunc(store Storelike, idx *ComponentExportIndex) 
 // any depth, the guest borrows it for the call and Call drops it afterwards;
 // for an `own` parameter the guest takes it. If an argument does not convert,
 // Call drops each handle it converted. After a trap, a lent handle stays in
-// the store until the store closes.
+// the store until the store closes. A failed call poisons the store, so each
+// later call fails, and Call drops the handles it converted for it.
 //
 // If a host function called during the call panics, Call panics with the
 // same value.
@@ -96,14 +97,18 @@ func (f *ComponentFunc) Call(store Storelike, args ...interface{}) (interface{},
 		nresults = 1
 	}
 
+	data := getDataInStore(store)
+	trapped := data.componentTrapped
 	err := C.wasmtime_component_func_call(&f.val, ctx,
 		componentValPtr(cargs), C.size_t(len(cargs)),
 		&cresults[0], C.size_t(nresults))
 	runtime.KeepAlive(f)
 	runtime.KeepAlive(store)
 	runtime.KeepAlive(args)
+	if err != nil {
+		data.componentTrapped = true
+	}
 
-	data := getDataInStore(store)
 	if data.lastPanic != nil {
 		lastPanic := data.lastPanic
 		data.lastPanic = nil
@@ -114,8 +119,17 @@ func (f *ComponentFunc) Call(store Storelike, args ...interface{}) (interface{},
 	}
 	// After a trap wasmtime still counts each borrow it lent for the call,
 	// so a drop fails, and the handle stays in the store until it closes.
+	// A later call never lowers its args, so the handles are still ours.
 	if err != nil {
-		return nil, mkError(err)
+		callErr := mkError(err)
+		if trapped {
+			for i := range cargs {
+				if dropErr := dropResources(ctx, &cargs[i]); dropErr != nil {
+					return nil, errors.Join(callErr, dropErr)
+				}
+			}
+		}
+		return nil, callErr
 	}
 
 	if err := dropBorrowedArgs(ctx, ty, cargs); err != nil {

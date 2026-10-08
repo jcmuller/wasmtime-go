@@ -94,6 +94,17 @@ func TestComponentFuncTrapWithABorrowReturnsOnlyTheTrap(t *testing.T) {
 	require.NotContains(t, err.Error(), "borrowed")
 }
 
+func TestComponentFuncDropsTheHandlesOfACallAfterATrap(t *testing.T) {
+	store, fn := instantiateBorrow(t, "", `(param "d" (borrow $doc))`, "(param i32)", "unreachable", nil)
+
+	_, err := fn.Call(store, doc())
+	require.ErrorContains(t, err, "unreachable")
+
+	_, err = fn.Call(store, doc())
+	require.ErrorContains(t, err, "cannot enter component instance")
+	require.Equal(t, 1, getDataInStore(store).droppedHandles)
+}
+
 func TestComponentFuncDropsABorrowInARecord(t *testing.T) {
 	store, fn := instantiateBorrow(t, `(type $r (record (field "d" (borrow $doc))))
   (export $r2 "r" (type $r))`, `(param "r" $r2)`, "(param i32)",
