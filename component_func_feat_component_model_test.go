@@ -124,6 +124,15 @@ func TestComponentFuncDropsABorrowInAList(t *testing.T) {
 	require.Equal(t, 1, getDataInStore(store).droppedHandles)
 }
 
+func TestComponentFuncDropsABorrowInAnOption(t *testing.T) {
+	store, fn := instantiateBorrow(t, "", `(param "o" (option (borrow $doc)))`, "(param i32 i32)",
+		"local.get 1\n      call $drop", nil)
+
+	_, err := fn.Call(store, ComponentOption{Val: doc()})
+	require.NoError(t, err)
+	require.Equal(t, 1, getDataInStore(store).droppedHandles)
+}
+
 func TestComponentFuncDropsTheHandlesBeforeABadArg(t *testing.T) {
 	store, fn := instantiateBorrow(t, "", `(param "d" (borrow $doc)) (param "x" u64)`, "(param i32 i64)", "", nil)
 
@@ -136,6 +145,14 @@ func TestComponentFuncDropsTheHandlesBeforeABadElement(t *testing.T) {
 	store, fn := instantiateBorrow(t, "", `(param "l" (list (borrow $doc)))`, "(param i32 i32)", "", nil)
 
 	_, err := fn.Call(store, []interface{}{doc(), 1})
+	require.ErrorContains(t, err, "unsupported component value type int")
+	require.Equal(t, 1, getDataInStore(store).droppedHandles)
+}
+
+func TestComponentFuncDropsAHandleInAnOptionBeforeABadElement(t *testing.T) {
+	store, fn := instantiateBorrow(t, "", `(param "l" (list (option (borrow $doc))))`, "(param i32 i32)", "", nil)
+
+	_, err := fn.Call(store, []interface{}{ComponentOption{Val: doc()}, 1})
 	require.ErrorContains(t, err, "unsupported component value type int")
 	require.Equal(t, 1, getDataInStore(store).droppedHandles)
 }

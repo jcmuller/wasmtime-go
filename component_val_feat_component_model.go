@@ -10,9 +10,9 @@ import (
 	"unsafe"
 )
 
-// TODO: map the remaining component value kinds (bool, the other integers,
-// floats, char, and the composite kinds other than list and record) and
-// guest-defined resources.
+// TODO: map the remaining component value kinds (bool, the integers other
+// than u32 and u64, floats, char, and the composite kinds other than list,
+// record, and option) and guest-defined resources.
 
 // ComponentResourceType is the type of a component resource. Create a
 // host-defined one with [NewComponentResourceTypeHost].
@@ -118,6 +118,8 @@ func (r *ComponentResourceHost) Close() {
 // mkComponentVal converts `val` to Go without taking ownership of it.
 func mkComponentVal(ctx *C.wasmtime_context_t, val *C.wasmtime_component_val_t) (interface{}, error) {
 	switch val.kind {
+	case C.WASMTIME_COMPONENT_U32:
+		return uint32(C.go_wasmtime_component_val_u32_get(val)), nil
 	case C.WASMTIME_COMPONENT_U64:
 		return uint64(C.go_wasmtime_component_val_u64_get(val)), nil
 	case C.WASMTIME_COMPONENT_STRING:
@@ -143,6 +145,16 @@ func mkComponentVal(ctx *C.wasmtime_context_t, val *C.wasmtime_component_val_t) 
 			record[i] = ComponentField{Name: name, Val: v}
 		}
 		return record, nil
+	case C.WASMTIME_COMPONENT_OPTION:
+		some := C.go_wasmtime_component_val_option_get(val)
+		if some == nil {
+			return ComponentOption{}, nil
+		}
+		v, err := mkComponentVal(ctx, some)
+		if err != nil {
+			return nil, err
+		}
+		return ComponentOption{Val: v}, nil
 	case C.WASMTIME_COMPONENT_RESOURCE:
 		var host *C.wasmtime_component_resource_host_t
 		err := C.wasmtime_component_resource_any_to_host(ctx, C.go_wasmtime_component_val_resource_get(val), &host)
@@ -165,6 +177,13 @@ type ComponentField struct {
 	Val  interface{}
 }
 
+// ComponentOption is a WIT `option` value. Val is the payload of `some`, or
+// nil for `none`. No value converts to a nil Go value, so a nil Val is never
+// a payload, and an `option<option<T>>` keeps `some(none)` apart from `none`.
+type ComponentOption struct {
+	Val interface{}
+}
+
 // setComponentVal writes `v` into `dst`, which the caller must delete with
 // `wasmtime_component_val_delete`. On error `dst` is a `bool`, which owns
 // nothing.
@@ -173,6 +192,9 @@ type ComponentField struct {
 // so a delete after a partial fill frees only what was written.
 func setComponentVal(ctx *C.wasmtime_context_t, dst *C.wasmtime_component_val_t, v interface{}) error {
 	switch v := v.(type) {
+	case uint32:
+		dst.kind = C.WASMTIME_COMPONENT_U32
+		C.go_wasmtime_component_val_u32_set(dst, C.uint32_t(v))
 	case uint64:
 		dst.kind = C.WASMTIME_COMPONENT_U64
 		C.go_wasmtime_component_val_u64_set(dst, C.uint64_t(v))
@@ -197,6 +219,19 @@ func setComponentVal(ctx *C.wasmtime_context_t, dst *C.wasmtime_component_val_t,
 				return deleteVec(ctx, dst, i, err)
 			}
 		}
+	case ComponentOption:
+		// The payload of `some` lives on the heap, and it moves there only
+		// after it converts, so an error allocates nothing.
+		var some *C.wasmtime_component_val_t
+		if v.Val != nil {
+			var payload C.wasmtime_component_val_t
+			if err := setComponentVal(ctx, &payload, v.Val); err != nil {
+				return err
+			}
+			some = C.wasmtime_component_val_new(&payload)
+		}
+		dst.kind = C.WASMTIME_COMPONENT_OPTION
+		C.go_wasmtime_component_val_option_set(dst, some)
 	case *ComponentResourceHost:
 		if !v.Owned() {
 			return errors.New("a host borrow handle exists only inside a call")

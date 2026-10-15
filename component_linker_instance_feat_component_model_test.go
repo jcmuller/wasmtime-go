@@ -320,3 +320,144 @@ func TestComponentFuncHostResource(t *testing.T) {
 	_, err = fn.Call(store, NewComponentResourceHost(false, 3, 7))
 	require.ErrorContains(t, err, "borrow handle exists only inside a call")
 }
+
+// u32Wat imports `echo` of type `u32 -> u32` from the host and exports `run`
+// of the same type, which calls it. A u32 lowers to one i32, so it needs no
+// memory.
+const u32Wat = `(component
+  (import "test:host/echo" (instance $h
+    (export "echo" (func (param "v" u32) (result u32)))))
+  (alias export $h "echo" (func $echo))
+  (core func $echo-core (canon lower (func $echo)))
+  (core module $m
+    (import "host" "echo" (func $echo (param i32) (result i32)))
+    (func (export "run") (param i32) (result i32)
+      local.get 0
+      call $echo))
+  (core instance $hi (export "echo" (func $echo-core)))
+  (core instance $i (instantiate $m (with "host" (instance $hi))))
+  (func (export "run") (param "v" u32) (result u32)
+    (canon lift (core func $i "run"))))`
+
+// instantiateU32 instantiates u32Wat with `f` behind `echo`.
+func instantiateU32(t *testing.T, f func([]interface{}) (interface{}, error)) (*Store, *ComponentFunc) {
+	t.Helper()
+	engine := newComponentEngine()
+	store := NewStore(engine)
+	component := newComponent(t, engine, u32Wat)
+	defer component.Close()
+
+	linker := defineFunc(t, engine, "test:host/echo", "echo", f)
+	defer linker.Close()
+
+	instance, err := linker.Instantiate(store, component)
+	require.NoError(t, err)
+
+	idx := instance.GetExportIndex(store, nil, "run")
+	require.NotNil(t, idx)
+	defer idx.Close()
+
+	return store, instance.GetFunc(store, idx)
+}
+
+// TestComponentFuncU32RefusesAUint64: only a Go uint32 is a u32, and wasmtime
+// checks each value against the function type, so a value past the u32 range
+// is an error and never wraps (A1).
+func TestComponentFuncU32RefusesAUint64(t *testing.T) {
+	store, fn := instantiateU32(t, echoArg)
+
+	_, err := fn.Call(store, uint64(1<<32+7))
+	require.ErrorContains(t, err, "type mismatch: expected u32, found u64")
+
+	store, fn = instantiateU32(t, func([]interface{}) (interface{}, error) {
+		return uint64(1<<32 + 7), nil
+	})
+
+	_, err = fn.Call(store, uint32(7))
+	require.ErrorContains(t, err, "type mismatch: expected u32, found u64")
+}
+
+func TestComponentFuncOptionRoundTrip(t *testing.T) {
+	store, fn := instantiateEcho(t, "(option u32)", echoArg)
+
+	for _, v := range []ComponentOption{{}, {Val: uint32(0)}, {Val: uint32(9)}} {
+		result, err := fn.Call(store, v)
+		require.NoError(t, err)
+		require.Equal(t, v, result)
+	}
+}
+
+func TestComponentFuncOptionWithABadPayload(t *testing.T) {
+	store, fn := instantiateEcho(t, "(option u32)", echoArg)
+
+	_, err := fn.Call(store, ComponentOption{Val: 9})
+	require.ErrorContains(t, err, "unsupported component value type int")
+}
+
+// findWat exports `find`, which returns `none` for 0 and else a point of x
+// and x+1. The result does not fit in one flat value, so `find` returns a
+// pointer to it: the case at 0 and the record at 8.
+const findWat = `(component
+  (core module $m
+    (memory (export "mem") 1)
+    (func (export "find") (param $x i64) (result i32)
+      local.get $x
+      i64.eqz
+      if
+        i32.const 1024
+        i32.const 0
+        i32.store8
+      else
+        i32.const 1024
+        i32.const 1
+        i32.store8
+        i32.const 1032
+        local.get $x
+        i64.store
+        i32.const 1040
+        local.get $x
+        i64.const 1
+        i64.add
+        i64.store
+      end
+      i32.const 1024))
+  (core instance $i (instantiate $m))
+  (alias core export $i "mem" (core memory $mem))
+  (type $point' (record (field "x" u64) (field "y" u64)))
+  (export $point "point" (type $point'))
+  (func (export "find") (param "x" u64) (result (option $point))
+    (canon lift (core func $i "find") (memory $mem))))`
+
+func TestComponentFuncReturnsAnOptionOfARecord(t *testing.T) {
+	engine := newComponentEngine()
+	store := NewStore(engine)
+	component := newComponent(t, engine, findWat)
+	defer component.Close()
+
+	linker := NewComponentLinker(engine)
+	defer linker.Close()
+	instance, err := linker.Instantiate(store, component)
+	require.NoError(t, err)
+	idx := instance.GetExportIndex(store, nil, "find")
+	require.NotNil(t, idx)
+	defer idx.Close()
+	fn := instance.GetFunc(store, idx)
+
+	result, err := fn.Call(store, uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, ComponentOption{}, result)
+
+	result, err = fn.Call(store, uint64(4))
+	require.NoError(t, err)
+	require.Equal(t, ComponentOption{Val: ComponentRecord{{Name: "x", Val: uint64(4)}, {Name: "y", Val: uint64(5)}}}, result)
+}
+
+func TestComponentFuncU32RoundTrip(t *testing.T) {
+	store, fn := instantiateU32(t, echoArg)
+
+	for _, v := range []uint32{0, 7, 1<<32 - 1} {
+		result, err := fn.Call(store, v)
+		require.NoError(t, err)
+		require.Equal(t, v, result)
+	}
+}

@@ -9,6 +9,10 @@ package wasmtime
 // static inline const wasmtime_component_record_type_t *go_component_valtype_record(const wasmtime_component_valtype_t *vt) {
 //   return vt->of.record;
 // }
+//
+// static inline const wasmtime_component_option_type_t *go_component_valtype_option(const wasmtime_component_valtype_t *vt) {
+//   return vt->of.option;
+// }
 import "C"
 
 import (
@@ -192,6 +196,15 @@ func dropBorrows(ctx *C.wasmtime_context_t, ty *C.wasmtime_component_valtype_t, 
 				return err
 			}
 		}
+	case ty.kind == C.WASMTIME_COMPONENT_VALTYPE_OPTION && val.kind == C.WASMTIME_COMPONENT_OPTION:
+		some := C.go_wasmtime_component_val_option_get(val)
+		if some == nil {
+			return nil
+		}
+		var payloadType C.wasmtime_component_valtype_t
+		C.wasmtime_component_option_type_ty(C.go_component_valtype_option(ty), &payloadType)
+		defer C.wasmtime_component_valtype_delete(&payloadType)
+		return dropBorrows(ctx, &payloadType, some)
 	}
 	return nil
 }
@@ -215,6 +228,10 @@ func dropResources(ctx *C.wasmtime_context_t, val *C.wasmtime_component_val_t) e
 			if err := dropResources(ctx, C.go_component_val_record_at(val, i)); err != nil {
 				return err
 			}
+		}
+	case C.WASMTIME_COMPONENT_OPTION:
+		if some := C.go_wasmtime_component_val_option_get(val); some != nil {
+			return dropResources(ctx, some)
 		}
 	}
 	return nil
