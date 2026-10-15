@@ -121,14 +121,11 @@ func mkComponentVal(ctx *C.wasmtime_context_t, val *C.wasmtime_component_val_t) 
 	case C.WASMTIME_COMPONENT_U64:
 		return uint64(C.go_wasmtime_component_val_u64_get(val)), nil
 	case C.WASMTIME_COMPONENT_STRING:
-		s := C.go_wasmtime_component_val_string_get(val)
-		return string(unsafe.Slice((*byte)(unsafe.Pointer(s.data)), int(s.size))), nil
+		return goString(C.go_component_val_string_data(val), C.go_component_val_string_len(val)), nil
 	case C.WASMTIME_COMPONENT_LIST:
-		l := C.go_wasmtime_component_val_list_get(val)
-		elems := unsafe.Slice(l.data, int(l.size))
-		list := make([]interface{}, len(elems))
-		for i := range elems {
-			v, err := mkComponentVal(ctx, &elems[i])
+		list := make([]interface{}, int(C.go_component_val_list_len(val)))
+		for i := range list {
+			v, err := mkComponentVal(ctx, C.go_component_val_list_at(val, C.size_t(i)))
 			if err != nil {
 				return nil, err
 			}
@@ -136,16 +133,14 @@ func mkComponentVal(ctx *C.wasmtime_context_t, val *C.wasmtime_component_val_t) 
 		}
 		return list, nil
 	case C.WASMTIME_COMPONENT_RECORD:
-		r := C.go_wasmtime_component_val_record_get(val)
-		entries := unsafe.Slice(r.data, int(r.size))
-		record := make(ComponentRecord, len(entries))
-		for i := range entries {
-			v, err := mkComponentVal(ctx, &entries[i].val)
+		record := make(ComponentRecord, int(C.go_component_val_record_len(val)))
+		for i := range record {
+			v, err := mkComponentVal(ctx, C.go_component_val_record_at(val, C.size_t(i)))
 			if err != nil {
 				return nil, err
 			}
-			name := entries[i].name
-			record[i] = ComponentField{Name: string(unsafe.Slice((*byte)(unsafe.Pointer(name.data)), int(name.size))), Val: v}
+			name := goString(C.go_component_val_record_name_data(val, C.size_t(i)), C.go_component_val_record_name_len(val, C.size_t(i)))
+			record[i] = ComponentField{Name: name, Val: v}
 		}
 		return record, nil
 	case C.WASMTIME_COMPONENT_RESOURCE:
@@ -171,7 +166,7 @@ type ComponentField struct {
 }
 
 // setComponentVal writes `v` into `dst`, which the caller must delete with
-// `wasmtime_component_val_delete`. On error `dst` is unchanged and owns
+// `wasmtime_component_val_delete`. On error `dst` is a `bool`, which owns
 // nothing.
 //
 // Each list element and record value starts as a `bool`, which owns nothing,
@@ -182,51 +177,26 @@ func setComponentVal(ctx *C.wasmtime_context_t, dst *C.wasmtime_component_val_t,
 		dst.kind = C.WASMTIME_COMPONENT_U64
 		C.go_wasmtime_component_val_u64_set(dst, C.uint64_t(v))
 	case string:
-		dst.kind = C.WASMTIME_COMPONENT_STRING
-		C.go_wasmtime_component_val_string_set(dst, stringToByteVec(v))
+		C.go_component_val_string_init(dst, cString(v), C.size_t(len(v)))
+		runtime.KeepAlive(v)
 	case []interface{}:
-		var l C.wasmtime_component_vallist_t
-		C.wasmtime_component_vallist_new_uninit(&l, C.size_t(len(v)))
-		elems := unsafe.Slice(l.data, len(v))
-		for i := range elems {
-			elems[i].kind = C.WASMTIME_COMPONENT_BOOL
-		}
+		C.go_component_val_list_init(dst, C.size_t(len(v)))
 		for i, e := range v {
-			if err := setComponentVal(ctx, &elems[i], e); err != nil {
-				for j := range elems[:i] {
-					if dropErr := dropResources(ctx, &elems[j]); dropErr != nil {
-						err = errors.Join(err, dropErr)
-						break
-					}
-				}
-				C.wasmtime_component_vallist_delete(&l)
-				return err
+			if err := setComponentVal(ctx, C.go_component_val_list_at(dst, C.size_t(i)), e); err != nil {
+				return deleteVec(ctx, dst, i, err)
 			}
 		}
-		dst.kind = C.WASMTIME_COMPONENT_LIST
-		C.go_wasmtime_component_val_list_set(dst, l)
 	case ComponentRecord:
-		var r C.wasmtime_component_valrecord_t
-		C.wasmtime_component_valrecord_new_uninit(&r, C.size_t(len(v)))
-		entries := unsafe.Slice(r.data, len(v))
-		for i := range entries {
-			entries[i].name = stringToByteVec(v[i].Name)
-			entries[i].val.kind = C.WASMTIME_COMPONENT_BOOL
+		C.go_component_val_record_init(dst, C.size_t(len(v)))
+		for i, f := range v {
+			C.go_component_val_record_set_name(dst, C.size_t(i), cString(f.Name), C.size_t(len(f.Name)))
+			runtime.KeepAlive(f.Name)
 		}
 		for i, f := range v {
-			if err := setComponentVal(ctx, &entries[i].val, f.Val); err != nil {
-				for j := range entries[:i] {
-					if dropErr := dropResources(ctx, &entries[j].val); dropErr != nil {
-						err = errors.Join(err, dropErr)
-						break
-					}
-				}
-				C.wasmtime_component_valrecord_delete(&r)
-				return err
+			if err := setComponentVal(ctx, C.go_component_val_record_at(dst, C.size_t(i)), f.Val); err != nil {
+				return deleteVec(ctx, dst, i, err)
 			}
 		}
-		dst.kind = C.WASMTIME_COMPONENT_RECORD
-		C.go_wasmtime_component_val_record_set(dst, r)
 	case *ComponentResourceHost:
 		if !v.Owned() {
 			return errors.New("a host borrow handle exists only inside a call")
@@ -243,4 +213,36 @@ func setComponentVal(ctx *C.wasmtime_context_t, dst *C.wasmtime_component_val_t,
 		return fmt.Errorf("unsupported component value type %T", v)
 	}
 	return nil
+}
+
+// deleteVec drops the resources in the first `n` elements of the list or
+// record in `dst`, frees it, and returns `err`.
+func deleteVec(ctx *C.wasmtime_context_t, dst *C.wasmtime_component_val_t, n int, err error) error {
+	for j := 0; j < n; j++ {
+		elem := C.go_component_val_record_at(dst, C.size_t(j))
+		if dst.kind == C.WASMTIME_COMPONENT_LIST {
+			elem = C.go_component_val_list_at(dst, C.size_t(j))
+		}
+		if dropErr := dropResources(ctx, elem); dropErr != nil {
+			err = errors.Join(err, dropErr)
+			break
+		}
+	}
+	C.go_component_val_vec_delete(dst)
+	return err
+}
+
+// goString copies the `n` bytes at `data` into a Go string. `data` is nil
+// when `n` is 0, as the shims give it.
+func goString(data *C.char, n C.size_t) string {
+	return string(unsafe.Slice((*byte)(unsafe.Pointer(data)), int(n)))
+}
+
+// cString returns the bytes of `s` for a C call that reads `len(s)` bytes, or
+// nil for an empty `s`. The caller keeps `s` alive until the call returns.
+func cString(s string) *C.char {
+	if len(s) == 0 {
+		return nil
+	}
+	return C._GoStringPtr(s)
 }

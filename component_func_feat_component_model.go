@@ -14,7 +14,6 @@ import "C"
 import (
 	"errors"
 	"runtime"
-	"unsafe"
 )
 
 // ComponentFunc is a function exported by a [ComponentInstance]. Get one
@@ -172,24 +171,22 @@ func dropBorrows(ctx *C.wasmtime_context_t, ty *C.wasmtime_component_valtype_t, 
 		var elemType C.wasmtime_component_valtype_t
 		C.wasmtime_component_list_type_element(C.go_component_valtype_list(ty), &elemType)
 		defer C.wasmtime_component_valtype_delete(&elemType)
-		l := C.go_wasmtime_component_val_list_get(val)
-		elems := unsafe.Slice(l.data, int(l.size))
-		for i := range elems {
-			if err := dropBorrows(ctx, &elemType, &elems[i]); err != nil {
+		n := C.go_component_val_list_len(val)
+		for i := C.size_t(0); i < n; i++ {
+			if err := dropBorrows(ctx, &elemType, C.go_component_val_list_at(val, i)); err != nil {
 				return err
 			}
 		}
 	case ty.kind == C.WASMTIME_COMPONENT_VALTYPE_RECORD && val.kind == C.WASMTIME_COMPONENT_RECORD:
-		r := C.go_wasmtime_component_val_record_get(val)
-		entries := unsafe.Slice(r.data, int(r.size))
-		for i := range entries {
+		n := C.go_component_val_record_len(val)
+		for i := C.size_t(0); i < n; i++ {
 			var name *C.char
 			var nameLen C.size_t
 			var fieldType C.wasmtime_component_valtype_t
-			if !C.wasmtime_component_record_type_field_nth(C.go_component_valtype_record(ty), C.size_t(i), &name, &nameLen, &fieldType) {
+			if !C.wasmtime_component_record_type_field_nth(C.go_component_valtype_record(ty), i, &name, &nameLen, &fieldType) {
 				continue
 			}
-			err := dropBorrows(ctx, &fieldType, &entries[i].val)
+			err := dropBorrows(ctx, &fieldType, C.go_component_val_record_at(val, i))
 			C.wasmtime_component_valtype_delete(&fieldType)
 			if err != nil {
 				return err
@@ -206,18 +203,16 @@ func dropResources(ctx *C.wasmtime_context_t, val *C.wasmtime_component_val_t) e
 	case C.WASMTIME_COMPONENT_RESOURCE:
 		return dropResource(ctx, val)
 	case C.WASMTIME_COMPONENT_LIST:
-		l := C.go_wasmtime_component_val_list_get(val)
-		elems := unsafe.Slice(l.data, int(l.size))
-		for i := range elems {
-			if err := dropResources(ctx, &elems[i]); err != nil {
+		n := C.go_component_val_list_len(val)
+		for i := C.size_t(0); i < n; i++ {
+			if err := dropResources(ctx, C.go_component_val_list_at(val, i)); err != nil {
 				return err
 			}
 		}
 	case C.WASMTIME_COMPONENT_RECORD:
-		r := C.go_wasmtime_component_val_record_get(val)
-		entries := unsafe.Slice(r.data, int(r.size))
-		for i := range entries {
-			if err := dropResources(ctx, &entries[i].val); err != nil {
+		n := C.go_component_val_record_len(val)
+		for i := C.size_t(0); i < n; i++ {
+			if err := dropResources(ctx, C.go_component_val_record_at(val, i)); err != nil {
 				return err
 			}
 		}
