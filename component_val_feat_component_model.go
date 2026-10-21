@@ -1,12 +1,37 @@
 package wasmtime
 
 // #include "shims.h"
+//
+// typedef struct {
+//   wasmtime_error_t *err;
+//   // host is NULL for a `borrow`, whose fields are in rep and ty.
+//   wasmtime_component_resource_host_t *host;
+//   uint32_t rep;
+//   uint32_t ty;
+// } go_component_resource_host_result_t;
+//
+// // go_component_resource_any_to_host converts `res` in one call and returns
+// // the result by value, so no Go pointer goes to C. It frees the handle of a
+// // `borrow` at once.
+// static inline go_component_resource_host_result_t go_component_resource_any_to_host(
+//     wasmtime_context_t *ctx, const wasmtime_component_resource_any_t *res) {
+//   go_component_resource_host_result_t r = {0};
+//   r.err = wasmtime_component_resource_any_to_host(ctx, res, &r.host);
+//   if (r.err == NULL && !wasmtime_component_resource_host_owned(r.host)) {
+//     r.rep = wasmtime_component_resource_host_rep(r.host);
+//     r.ty = wasmtime_component_resource_host_type(r.host);
+//     wasmtime_component_resource_host_delete(r.host);
+//     r.host = NULL;
+//   }
+//   return r;
+// }
 import "C"
 
 import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sync"
 	"unsafe"
 )
 
@@ -57,6 +82,22 @@ func (rt *ComponentResourceType) Close() {
 // its type is the tag given to [NewComponentResourceTypeHost].
 type ComponentResourceHost struct {
 	_ptr *C.wasmtime_component_resource_host_t
+	// lent is set on the `borrow` handle of a host call. It has no C handle,
+	// and rep and ty hold its fields.
+	lent    bool
+	rep, ty uint32
+}
+
+// gLentHandles holds the `borrow` handles of host calls that returned, so a
+// borrow allocates no handle and sets no finalizer.
+var gLentHandles = sync.Pool{New: func() interface{} { return new(ComponentResourceHost) }}
+
+// lendComponentResourceHost returns a `borrow` handle from gLentHandles.
+// callComponentFunc returns it to the pool when the host call returns.
+func lendComponentResourceHost(rep, ty uint32) *ComponentResourceHost {
+	r := gLentHandles.Get().(*ComponentResourceHost)
+	r.lent, r.rep, r.ty = true, rep, ty
+	return r
 }
 
 // NewComponentResourceHost returns a handle to the host resource `rep` of
@@ -84,6 +125,9 @@ func (r *ComponentResourceHost) ptr() *C.wasmtime_component_resource_host_t {
 
 // Rep returns the host-defined number behind this handle.
 func (r *ComponentResourceHost) Rep() uint32 {
+	if r.lent {
+		return r.rep
+	}
 	ret := uint32(C.wasmtime_component_resource_host_rep(r.ptr()))
 	runtime.KeepAlive(r)
 	return ret
@@ -91,6 +135,9 @@ func (r *ComponentResourceHost) Rep() uint32 {
 
 // Type returns the tag of this resource's type.
 func (r *ComponentResourceHost) Type() uint32 {
+	if r.lent {
+		return r.ty
+	}
 	ret := uint32(C.wasmtime_component_resource_host_type(r.ptr()))
 	runtime.KeepAlive(r)
 	return ret
@@ -98,6 +145,9 @@ func (r *ComponentResourceHost) Type() uint32 {
 
 // Owned reports whether this is an `own` handle rather than a `borrow`.
 func (r *ComponentResourceHost) Owned() bool {
+	if r.lent {
+		return false
+	}
 	ret := bool(C.wasmtime_component_resource_host_owned(r.ptr()))
 	runtime.KeepAlive(r)
 	return ret
@@ -156,12 +206,14 @@ func mkComponentVal(ctx *C.wasmtime_context_t, val *C.wasmtime_component_val_t) 
 		}
 		return ComponentOption{Val: v}, nil
 	case C.WASMTIME_COMPONENT_RESOURCE:
-		var host *C.wasmtime_component_resource_host_t
-		err := C.wasmtime_component_resource_any_to_host(ctx, C.go_wasmtime_component_val_resource_get(val), &host)
-		if err != nil {
-			return nil, mkError(err)
+		res := C.go_component_resource_any_to_host(ctx, C.go_wasmtime_component_val_resource_get(val))
+		if res.err != nil {
+			return nil, mkError(res.err)
 		}
-		return mkComponentResourceHost(host), nil
+		if res.host == nil {
+			return lendComponentResourceHost(uint32(res.rep), uint32(res.ty)), nil
+		}
+		return mkComponentResourceHost(res.host), nil
 	default:
 		return nil, fmt.Errorf("unsupported component value kind %d", val.kind)
 	}

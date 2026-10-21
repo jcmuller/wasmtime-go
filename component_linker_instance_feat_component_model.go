@@ -70,6 +70,11 @@ func (li *ComponentLinkerInstance) AddInstance(name string) (*ComponentLinkerIns
 // the import, so `f` must check them. See [ComponentFunc.Call] for the Go
 // type of each value. `f` returns nil for a function without a result.
 //
+// A `borrow` handle in the arguments, at any depth, is valid only until `f`
+// returns. Then it panics like a closed handle, and a later host call can
+// reuse it for another borrow, so `f` must not keep it. An `own` handle
+// belongs to `f`.
+//
 // If `f` returns an error, the guest traps with its message. If `f` panics,
 // the guest traps and the panic resumes in Go at the call that entered the
 // guest.
@@ -238,6 +243,7 @@ func callComponentFunc(
 	cargs, cresults []C.wasmtime_component_val_t,
 ) error {
 	args := make([]interface{}, len(cargs))
+	defer releaseBorrows(args)
 	for i := range cargs {
 		arg, err := mkComponentVal(ctx, &cargs[i])
 		if err != nil {
@@ -258,6 +264,36 @@ func callComponentFunc(
 		return setComponentVal(ctx, &cresults[0], result)
 	default:
 		return errors.New("callback result does not match the function type")
+	}
+}
+
+// releaseBorrows returns each `borrow` handle in `args`, at any depth, to
+// gLentHandles, because a borrow lives only for the host call that gets it.
+// A kept handle then panics like a closed one, until a later borrow reuses
+// it.
+func releaseBorrows(args []interface{}) {
+	for _, arg := range args {
+		releaseBorrow(arg)
+	}
+}
+
+// releaseBorrow is releaseBorrows for one value. The check of `lent` stops a
+// handle that `f` put twice in `args` from going twice into the pool.
+func releaseBorrow(v interface{}) {
+	switch v := v.(type) {
+	case *ComponentResourceHost:
+		if v.lent {
+			v.lent = false
+			gLentHandles.Put(v)
+		}
+	case []interface{}:
+		releaseBorrows(v)
+	case ComponentRecord:
+		for _, f := range v {
+			releaseBorrow(f.Val)
+		}
+	case ComponentOption:
+		releaseBorrow(v.Val)
 	}
 }
 

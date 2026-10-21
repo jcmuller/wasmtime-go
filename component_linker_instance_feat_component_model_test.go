@@ -3,6 +3,7 @@ package wasmtime
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -282,6 +283,8 @@ func TestComponentFuncHostResource(t *testing.T) {
 	defer component.Close()
 
 	var self *ComponentResourceHost
+	var rep, ty uint32
+	var owned bool
 	linker := NewComponentLinker(engine)
 	defer linker.Close()
 	root := linker.Root()
@@ -294,6 +297,7 @@ func TestComponentFuncHostResource(t *testing.T) {
 	}))
 	require.NoError(t, li.AddFunc("[method]doc.len", func(args []interface{}) (interface{}, error) {
 		self = args[0].(*ComponentResourceHost)
+		rep, ty, owned = self.Rep(), self.Type(), self.Owned()
 		return uint64(10), nil
 	}))
 	li.Close()
@@ -311,14 +315,237 @@ func TestComponentFuncHostResource(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, uint64(10), result)
 	}
-	require.Equal(t, uint32(3), self.Rep())
-	require.Equal(t, uint32(7), self.Type())
-	require.False(t, self.Owned())
+	require.Equal(t, uint32(3), rep)
+	require.Equal(t, uint32(7), ty)
+	require.False(t, owned)
+	// A borrow handle lives only for the host call that gets it.
+	require.PanicsWithValue(t, "object has been closed already", func() { self.Rep() })
 	// Call drops a lent handle as a borrow, which runs no destructor.
 	require.Empty(t, dropped)
 
 	_, err = fn.Call(store, NewComponentResourceHost(false, 3, 7))
 	require.ErrorContains(t, err, "borrow handle exists only inside a call")
+}
+
+// TestComponentFuncHostBorrowAllocatesNoHandle: the only allocation of a host
+// call that gets a borrow is its args slice, so the borrow allocates no
+// ComponentResourceHost. Two guests that call `len` once and twice give the
+// cost of one host call. Mallocs counts the whole process, so the test does
+// not run in parallel.
+func TestComponentFuncHostBorrowAllocatesNoHandle(t *testing.T) {
+	callLen := "local.get 0\n      call $len\n      drop\n      "
+	allocs := func(calls int) float64 {
+		store, fn := instantiateBorrow(t, "", `(param "d" (borrow $doc))`, "(param i32)",
+			strings.Repeat(callLen, calls)+"local.get 0\n      call $drop", nil)
+		d := doc()
+		return testing.AllocsPerRun(100, func() {
+			_, err := fn.Call(store, d)
+			require.NoError(t, err)
+		})
+	}
+
+	require.Equal(t, 1.0, allocs(2)-allocs(1))
+}
+
+// takeWat imports a host resource `doc` and a host func `take` with the
+// params `%[1]s`, after the instance types `%[4]s`. It exports `run`, which
+// borrows two docs, runs `%[3]s` to call `take` with the core params
+// `%[2]s`, and drops the borrows.
+const takeWat = `(component
+  (import "test:host/doc" (instance $host
+    (export "doc" (type $doc (sub resource)))
+    %[4]s
+    (export "take" (func %[1]s))))
+  (alias export $host "doc" (type $doc))
+  (alias export $host "take" (func $take))
+  (core module $libc (memory (export "mem") 1))
+  (core instance $libc (instantiate $libc))
+  (alias core export $libc "mem" (core memory $mem))
+  (core func $take-core (canon lower (func $take) (memory $mem)))
+  (core func $drop-core (canon resource.drop $doc))
+  (core module $m
+    (import "host" "take" (func $take %[2]s))
+    (import "host" "drop" (func $drop (param i32)))
+    (import "libc" "mem" (memory 1))
+    (func (export "run") (param i32 i32)
+      %[3]s
+      local.get 0
+      call $drop
+      local.get 1
+      call $drop))
+  (core instance $hi
+    (export "take" (func $take-core))
+    (export "drop" (func $drop-core)))
+  (core instance $li (export "mem" (memory $mem)))
+  (core instance $i (instantiate $m (with "host" (instance $hi)) (with "libc" (instance $li))))
+  (func (export "run") (param "a" (borrow $doc)) (param "b" (borrow $doc))
+    (canon lift (core func $i "run"))))`
+
+// instantiateTake instantiates `wat`, which imports a host resource `doc` and
+// a host func `take`, with `take` as that func, and returns its `run` export.
+func instantiateTake(t *testing.T, wat string, take func([]interface{}) (interface{}, error)) (*Store, *ComponentFunc) {
+	t.Helper()
+	engine := newComponentEngine()
+	store := NewStore(engine)
+	component := newComponent(t, engine, wat)
+	defer component.Close()
+
+	linker := NewComponentLinker(engine)
+	defer linker.Close()
+	root := linker.Root()
+	li, err := root.AddInstance("test:host/doc")
+	require.NoError(t, err)
+	require.NoError(t, li.AddResource("doc", NewComponentResourceTypeHost(7), nil))
+	require.NoError(t, li.AddFunc("take", take))
+	li.Close()
+	root.Close()
+
+	instance, err := linker.Instantiate(store, component)
+	require.NoError(t, err)
+	idx := instance.GetExportIndex(store, nil, "run")
+	require.NotNil(t, idx)
+	defer idx.Close()
+	return store, instance.GetFunc(store, idx)
+}
+
+// TestComponentFuncHostBorrowsAtEachDepth: each borrow of a host call gets
+// its own handle, and each one closes when the call returns, at any depth.
+func TestComponentFuncHostBorrowsAtEachDepth(t *testing.T) {
+	handle := func(v interface{}) *ComponentResourceHost { return v.(*ComponentResourceHost) }
+	tests := []struct {
+		name, types, params, coreParams, body string
+		handles                               func(args []interface{}) []*ComponentResourceHost
+	}{
+		{
+			name:       "two params",
+			params:     `(param "a" (borrow $doc)) (param "b" (borrow $doc))`,
+			coreParams: "(param i32 i32)",
+			body:       "local.get 0\n      local.get 1\n      call $take",
+			handles: func(args []interface{}) []*ComponentResourceHost {
+				return []*ComponentResourceHost{handle(args[0]), handle(args[1])}
+			},
+		},
+		{
+			name:       "list",
+			params:     `(param "l" (list (borrow $doc)))`,
+			coreParams: "(param i32 i32)",
+			body: "i32.const 0\n      local.get 0\n      i32.store\n      " +
+				"i32.const 4\n      local.get 1\n      i32.store\n      " +
+				"i32.const 0\n      i32.const 2\n      call $take",
+			handles: func(args []interface{}) []*ComponentResourceHost {
+				l := args[0].([]interface{})
+				return []*ComponentResourceHost{handle(l[0]), handle(l[1])}
+			},
+		},
+		{
+			name:       "option",
+			params:     `(param "a" (borrow $doc)) (param "o" (option (borrow $doc)))`,
+			coreParams: "(param i32 i32 i32)",
+			body:       "local.get 0\n      i32.const 1\n      local.get 1\n      call $take",
+			handles: func(args []interface{}) []*ComponentResourceHost {
+				return []*ComponentResourceHost{handle(args[0]), handle(args[1].(ComponentOption).Val)}
+			},
+		},
+		{
+			name:       "record",
+			types:      `(type $r (record (field "a" (borrow $doc)) (field "b" (borrow $doc)))) (export "r" (type $r2 (eq $r)))`,
+			params:     `(param "r" $r2)`,
+			coreParams: "(param i32 i32)",
+			body:       "local.get 0\n      local.get 1\n      call $take",
+			handles: func(args []interface{}) []*ComponentResourceHost {
+				r := args[0].(ComponentRecord)
+				return []*ComponentResourceHost{handle(r[0].Val), handle(r[1].Val)}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var kept []*ComponentResourceHost
+			var reps []uint32
+			wat := fmt.Sprintf(takeWat, tt.params, tt.coreParams, tt.body, tt.types)
+			store, fn := instantiateTake(t, wat, func(args []interface{}) (interface{}, error) {
+				kept = tt.handles(args)
+				for _, h := range kept {
+					reps = append(reps, h.Rep())
+				}
+				return nil, nil
+			})
+
+			_, err := fn.Call(store, NewComponentResourceHost(true, 3, 7), NewComponentResourceHost(true, 4, 7))
+			require.NoError(t, err)
+			require.Equal(t, []uint32{3, 4}, reps)
+			for _, h := range kept {
+				require.PanicsWithValue(t, "object has been closed already", func() { h.Rep() })
+			}
+		})
+	}
+}
+
+// TestComponentFuncHostBorrowPutTwiceInArgs: a host func that puts one
+// borrow twice in its args does not make a later call share a handle.
+func TestComponentFuncHostBorrowPutTwiceInArgs(t *testing.T) {
+	var reps []uint32
+	calls := 0
+	wat := fmt.Sprintf(takeWat, `(param "a" (borrow $doc)) (param "b" (borrow $doc))`, "(param i32 i32)",
+		"local.get 0\n      local.get 1\n      call $take", "")
+	store, fn := instantiateTake(t, wat, func(args []interface{}) (interface{}, error) {
+		calls++
+		if calls == 1 {
+			args[1] = args[0]
+			return nil, nil
+		}
+		reps = []uint32{args[0].(*ComponentResourceHost).Rep(), args[1].(*ComponentResourceHost).Rep()}
+		return nil, nil
+	})
+
+	for i := 0; i < 2; i++ {
+		_, err := fn.Call(store, NewComponentResourceHost(true, 3, 7), NewComponentResourceHost(true, 4, 7))
+		require.NoError(t, err)
+	}
+	require.Equal(t, []uint32{3, 4}, reps)
+}
+
+// ownWat imports a host resource `doc` and a host func `take`, which takes an
+// owned doc. It exports `run`, which gives its owned doc to `take`.
+const ownWat = `(component
+  (import "test:host/doc" (instance $host
+    (export "doc" (type $doc (sub resource)))
+    (export "take" (func (param "d" (own $doc))))))
+  (alias export $host "doc" (type $doc))
+  (alias export $host "take" (func $take))
+  (core func $take-core (canon lower (func $take)))
+  (core module $m
+    (import "host" "take" (func $take (param i32)))
+    (func (export "run") (param i32)
+      local.get 0
+      call $take))
+  (core instance $hi (export "take" (func $take-core)))
+  (core instance $i (instantiate $m (with "host" (instance $hi))))
+  (func (export "run") (param "d" (own $doc))
+    (canon lift (core func $i "run"))))`
+
+// TestComponentFuncHostOwnOutlivesTheCall: an `own` handle that a host func
+// gets belongs to the host, so it lives after the call until the host closes
+// it, and each call gets a new one.
+func TestComponentFuncHostOwnOutlivesTheCall(t *testing.T) {
+	var kept []*ComponentResourceHost
+	store, fn := instantiateTake(t, ownWat, func(args []interface{}) (interface{}, error) {
+		kept = append(kept, args[0].(*ComponentResourceHost))
+		return nil, nil
+	})
+
+	for i := 0; i < 2; i++ {
+		_, err := fn.Call(store, doc())
+		require.NoError(t, err)
+	}
+	require.NotSame(t, kept[0], kept[1])
+	for _, h := range kept {
+		require.True(t, h.Owned())
+		require.Equal(t, uint32(3), h.Rep())
+		require.Equal(t, uint32(7), h.Type())
+		h.Close()
+		require.PanicsWithValue(t, "object has been closed already", func() { h.Rep() })
+	}
 }
 
 // u32Wat imports `echo` of type `u32 -> u32` from the host and exports `run`
